@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="SVJ">
+<meta name="theme-color" content="#1f4e79">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.svg">
+<title>SVJ účetnictví</title>
+<style>
+:root{--m:#1f4e79;--bg:#f4f6f8;--c:#fff;--t:#222;--r:#c0392b;--g:#27ae60;--pb:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--t);padding-bottom:calc(70px + var(--pb))}
+header{background:var(--m);color:#fff;padding:14px 16px;padding-top:calc(14px + env(safe-area-inset-top,0px));font-weight:600}
+main{padding:12px}
+.card{background:var(--c);border-radius:10px;padding:12px;margin-bottom:10px;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:#fff;border-top:1px solid #ddd;padding-bottom:var(--pb)}
+nav button{flex:1;padding:12px 4px;border:0;background:none;font-size:12px;color:#555}
+nav button.act{color:var(--m);font-weight:600}
+input,select{width:100%;padding:10px;margin:4px 0 8px;border:1px solid #ccc;border-radius:8px;font-size:16px}
+button.p{background:var(--m);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:15px;width:100%}
+button.s{background:#e5e9ee;border:0;border-radius:8px;padding:6px 10px;font-size:13px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee}
+.neg{color:var(--r)} .pos{color:var(--g)}
+small{color:#777}
+</style>
+</head>
+<body>
+<header>SVJ účetnictví</header>
+<main id="app"></main>
+<nav id="nav"></nav>
+
+<script>
+// ===== IndexedDB =====
+const DB_NAME = 'svj', DB_VER = 1;
+let db;
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, DB_VER);
+    r.onupgradeneeded = e => {
+      const d = e.target.result;
+      d.createObjectStore('jednotky', { keyPath: 'id', autoIncrement: true });
+      d.createObjectStore('predpisy', { keyPath: 'id', autoIncrement: true }); // {jednotka, mesic, kategorie, castka}
+      d.createObjectStore('uhrady', { keyPath: 'id', autoIncrement: true });   // {jednotka, datum, castka, kategorie}
+      d.createObjectStore('vydaje', { keyPath: 'id', autoIncrement: true });   // {datum, castka, kategorie, popis}
+    };
+    r.onsuccess = e => { db = e.target.result; res(db); };
+    r.onerror = rej;
+  });
+}
+function dbAll(store) {
+  return new Promise(res => {
+    const q = db.transaction(store).objectStore(store).getAll();
+    q.onsuccess = () => res(q.result);
+  });
+}
+function dbPut(store, obj) {
+  return new Promise(res => {
+    const q = db.transaction(store, 'readwrite').objectStore(store).put(obj);
+    q.onsuccess = () => res(q.result);
+  });
+}
+function dbDel(store, id) {
+  return new Promise(res => {
+    const q = db.transaction(store, 'readwrite').objectStore(store).delete(id);
+    q.onsuccess = () => res();
+  });
+}
+
+// ===== Navigace =====
+const SEKCE = {
+  jednotky: 'Jednotky',
+  prehled: 'Saldo',
+  zaznamy: 'Platby',
+  vydaje: 'Výdaje',
+  vyuctovani: 'Vyúčtování',
+  zaloha: 'Záloha'
+};
+let aktivni = 'jednotky';
+
+function renderNav() {
+  document.getElementById('nav').innerHTML = Object.keys(SEKCE).map(k =>
+    `<button class="${k === aktivni ? 'act' : ''}" onclick="go('${k}')">${SEKCE[k]}</button>`
+  ).join('');
+}
+function go(s) { aktivni = s; render(); }
+
+// ===== Pomocné =====
+const fmt = n => Number(n || 0).toLocaleString('cs-CZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' Kč';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ===== Obrazovky =====
+async function render() {
+  renderNav();
+  const app = document.getElementById('app');
+  if (aktivni === 'jednotky') app.innerHTML = await vJednotky();
+  else if (aktivni === 'prehled') app.innerHTML = await vSaldo();
+  else if (aktivni === 'zaznamy') app.innerHTML = await vPlatby();
+  else if (aktivni === 'vydaje') app.innerHTML = await vVydaje();
+  else if (aktivni === 'vyuctovani') app.innerHTML = await vVyuctovani();
+  else if (aktivni === 'zaloha') app.innerHTML = vZaloha();
+}
+
+function vZaloha() {
+  return `<div class="card"><b>Záloha dat</b>
+    <button class="p" onclick="exportZaloha()">Exportovat JSON</button><br><br>
+    <input type="file" id="imp" accept="application/json" onchange="importZaloha(this.files[0])">
+    <small>Import přepíše stávající data.</small></div>`;
+}
+async function exportZaloha() {
+  const data = {};
+  for (const s of ['jednotky', 'predpisy', 'uhrady', 'vydaje']) data[s] = await dbAll(s);
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `svj-zaloha-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+}
+async function importZaloha(file) {
+  if (!file || !confirm('Přepsat stávající data?')) return;
+  const data = JSON.parse(await file.text());
+  for (const s of ['jednotky', 'predpisy', 'uhrady', 'vydaje']) {
+    await new Promise(res => {
+      const tx = db.transaction(s, 'readwrite');
+      tx.objectStore(s).clear();
+      (data[s] || []).forEach(o => tx.objectStore(s).put(o));
+      tx.oncomplete = res;
+    });
+  }
+  render();
+}
+
+async function vJednotky() {
+  const j = await dbAll('jednotky');
+  const rows = j.map(u => `<div class="row"><div>
+      <b>Byt ${esc(u.cislo)}</b> <small>${esc(u.vlastnik)}</small><br>
+      <small>${esc(u.plocha)} m² · ${esc(u.osoby)} osob · podíl ${esc(u.podil)}</small></div>
+      <button class="s" onclick="smazat('jednotky',${u.id})">Smazat</button></div>`).join('');
+  return `<div class="card"><b>Jednotky (${j.length})</b>${rows || '<small>Zatím žádné.</small>'}</div>
+    <div class="card">
+      <input id="j_cislo" placeholder="Číslo bytu">
+      <input id="j_vlastnik" placeholder="Vlastník">
+      <input id="j_plocha" type="number" placeholder="Plocha m²">
+      <input id="j_osoby" type="number" placeholder="Počet osob">
+      <input id="j_podil" type="number" step="0.0001" placeholder="Podíl (např. 0.1667)">
+      <button class="p" onclick="ulozJednotku()">Přidat jednotku</button>
+    </div>`;
+}
+async function ulozJednotku() {
+  const v = id => document.getElementById(id).value.trim();
+  if (!v('j_cislo')) return alert('Zadejte číslo bytu');
+  await dbPut('jednotky', {
+    cislo: v('j_cislo'), vlastnik: v('j_vlastnik'),
+    plocha: parseFloat(v('j_plocha')) || 0,
+    osoby: parseInt(v('j_osoby')) || 0,
+    podil: parseFloat(v('j_podil')) || 0
+  });
+  render();
+}
+
+async function vSaldo() {
+  const j = await dbAll('jednotky'), p = await dbAll('predpisy'), u = await dbAll('uhrady');
+  const radky = j.map(x => {
+    const pred = p.filter(o => o.jednotka === x.id).reduce((s, o) => s + o.castka, 0);
+    const uhr = u.filter(o => o.jednotka === x.id).reduce((s, o) => s + o.castka, 0);
+    const saldo = uhr - pred; // záporné = nedoplatek
+    return `<div class="row"><span>Byt ${esc(x.cislo)}</span>
+      <span class="${saldo < 0 ? 'neg' : 'pos'}">${fmt(saldo)}</span></div>`;
+  }).join('');
+  return `<div class="card"><b>Saldo jednotek</b>${radky || '<small>Žádné jednotky.</small>'}</div>`;
+}
+
+async function vPlatby() {
+  const j = await dbAll('jednotky');
+  const opts = j.map(x => `<option value="${x.id}">Byt ${esc(x.cislo)}</option>`).join('');
+  return `<div class="card"><b>Předpis</b>
+      <select id="p_j">${opts}</select>
+      <select id="p_k"><option value="sluzby">Služby</option><option value="fond">Fond oprav</option></select>
+      <input id="p_mes" type="month">
+      <input id="p_c" type="number" placeholder="Částka Kč">
+      <button class="p" onclick="ulozPredpis()">Uložit předpis</button></div>
+    <div class="card"><b>Úhrada</b>
+      <select id="u_j">${opts}</select>
+      <select id="u_k"><option value="sluzby">Služby</option><option value="fond">Fond oprav</option></select>
+      <input id="u_d" type="date">
+      <input id="u_c" type="number" placeholder="Částka Kč">
+      <button class="p" onclick="ulozUhradu()">Uložit úhradu</button></div>`;
+}
+async function ulozPredpis() {
+  await dbPut('predpisy', {
+    jednotka: parseInt(val('p_j')), kategorie: val('p_k'),
+    mesic: val('p_mes'), castka: parseFloat(val('p_c')) || 0
+  });
+  render();
+}
+async function ulozUhradu() {
+  await dbPut('uhrady', {
+    jednotka: parseInt(val('u_j')), kategorie: val('u_k'),
+    datum: val('u_d'), castka: parseFloat(val('u_c')) || 0
+  });
+  render();
+}
+const val = id => document.getElementById(id).value;
+
+async function vVydaje() {
+  const v = await dbAll('vydaje');
+  const rows = v.map(x => `<div class="row"><div><small>${esc(x.datum)} · ${esc(x.kategorie)}</small><br>${esc(x.popis)}</div>
+    <div>${fmt(x.castka)} <button class="s" onclick="smazat('vydaje',${x.id})">×</button></div></div>`).join('');
+  return `<div class="card"><b>Výdaje SVJ</b>${rows || '<small>Zatím žádné.</small>'}</div>
+    <div class="card">
+      <input id="v_d" type="date">
+      <select id="v_k"><option>Opravy</option><option>Pojištění</option><option>Energie</option><option>Úklid</option><option>Správa</option><option>Revize</option><option>Ostatní</option></select>
+      <input id="v_p" placeholder="Popis">
+      <input id="v_c" type="number" placeholder="Částka Kč">
+      <button class="p" onclick="ulozVydaj()">Přidat výdaj</button></div>`;
+}
+async function ulozVydaj() {
+  await dbPut('vydaje', {
+    datum: val('v_d'), kategorie: val('v_k'),
+    popis: val('v_p'), castka: parseFloat(val('v_c')) || 0
+  });
+  render();
+}
+
+async function vVyuctovani() {
+  const j = await dbAll('jednotky'), p = await dbAll('predpisy'), u = await dbAll('uhrady');
+  const roky = [...new Set(p.map(o => o.mesic.slice(0, 4)))].sort().reverse();
+  const rok = roky[0] || new Date().getFullYear().toString();
+  const radky = j.map(x => {
+    const pred = p.filter(o => o.jednotka === x.id && o.mesic.startsWith(rok)).reduce((s, o) => s + o.castka, 0);
+    const uhr = u.filter(o => o.jednotka === x.id && o.datum.startsWith(rok)).reduce((s, o) => s + o.castka, 0);
+    return `<div class="row"><span>Byt ${esc(x.cislo)} <small>(${rok})</small></span>
+      <span class="${uhr - pred < 0 ? 'neg' : 'pos'}">${fmt(uhr - pred)}</span></div>`;
+  }).join('');
+  return `<div class="card"><b>Roční vyúčtování ${rok}</b>${radky || '<small>Žádná data.</small>'}</div>`;
+}
+
+async function smazat(store, id) {
+  if (!confirm('Smazat?')) return;
+  await dbDel(store, id);
+  render();
+}
+
+// ===== Start =====
+openDB().then(render);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
